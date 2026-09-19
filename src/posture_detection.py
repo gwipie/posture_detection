@@ -117,13 +117,15 @@ class PoseDetector:
         
         resized = cv2.resize(image, (new_w, new_h))
         
-        pad_width = (self.input_width - new_w) // 2
-        pad_height = (self.input_height - new_h) // 2
+        pad_left = (self.input_width - new_w) // 2
+        pad_right = self.input_width - new_w - pad_left
+        pad_top = (self.input_height - new_h) // 2
+        pad_bottom = self.input_height - new_h - pad_top
         
         padded = cv2.copyMakeBorder(
             resized,
-            pad_height, pad_height,
-            pad_width, pad_width,
+            pad_top, pad_bottom,
+            pad_left, pad_right,
             cv2.BORDER_CONSTANT,
             value=(114, 114, 114)
         )
@@ -133,7 +135,7 @@ class PoseDetector:
         processed = np.transpose(processed, (2, 0, 1))
         processed = np.expand_dims(processed, axis=0)
         
-        return processed, scale_factor, pad_width, pad_height
+        return processed, scale_factor, pad_left, pad_top
     
     def _postprocess(self, output, scale_factor, pad_width, pad_height, original_width, original_height):
         """
@@ -154,46 +156,48 @@ class PoseDetector:
         Returns:
             keypoints: 关键点列表
         """
-        keypoints = []
-        
         if len(output.shape) == 3:
             output = output[0]
-        
-        num_detections = output.shape[1]
+
+        # Accept both common layouts: [56, candidates] and [candidates, 56].
+        if output.ndim == 2 and output.shape[0] != 56 and output.shape[1] == 56:
+            output = output.T
+
+        if output.ndim != 2 or output.shape[0] != 56:
+            raise ValueError(f"不支持的模型输出形状: {output.shape}")
+
         target_indices = [0, 6, 12, 14]  # 鼻、右肩、右髋、右膝
-        
-        for i in range(num_detections):
-            detection = output[:, i]
-            
-            obj_conf = detection[4]
-            
-            if obj_conf > self.conf_threshold:
-                for kp_idx in target_indices:
-                    base_idx = 5 + kp_idx * 3
-                    x = detection[base_idx]
-                    y = detection[base_idx + 1]
-                    kp_conf = detection[base_idx + 2]
-                    
-                    if kp_conf > self.conf_threshold:
-                        x = (x - pad_width) / scale_factor
-                        y = (y - pad_height) / scale_factor
-                        
-                        x = max(0, min(int(x), original_width))  # 限制在原始图像范围内
-                        y = max(0, min(int(y), original_height))
-                        
-                        keypoints.append({
-                            'index': kp_idx,
-                            'x': x,
-                            'y': y,
-                            'confidence': kp_conf
-                        })
-        
-        unique_keypoints = {}
-        for kp in keypoints:
-            if kp['index'] not in unique_keypoints or kp['confidence'] > unique_keypoints[kp['index']]['confidence']:
-                unique_keypoints[kp['index']] = kp
-        
-        return list(unique_keypoints.values())
+
+        # 当前应用是单人坐姿检测。必须从同一个人体候选中取全部关键点，
+        # 不能逐关键点跨候选取最大置信度，否则多人场景会把不同人的点拼在一起。
+        valid_indices = np.flatnonzero(output[4, :] > self.conf_threshold)
+        if valid_indices.size == 0:
+            return []
+        best_index = valid_indices[np.argmax(output[4, valid_indices])]
+        detection = output[:, best_index]
+
+        keypoints = []
+        for kp_idx in target_indices:
+            base_idx = 5 + kp_idx * 3
+            x = detection[base_idx]
+            y = detection[base_idx + 1]
+            kp_conf = detection[base_idx + 2]
+
+            if kp_conf > self.conf_threshold:
+                x = (x - pad_width) / scale_factor
+                y = (y - pad_height) / scale_factor
+
+                x = max(0, min(int(x), original_width - 1))
+                y = max(0, min(int(y), original_height - 1))
+
+                keypoints.append({
+                    'index': kp_idx,
+                    'x': x,
+                    'y': y,
+                    'confidence': float(kp_conf)
+                })
+
+        return keypoints
     
     def detect(self, image):
         """

@@ -98,7 +98,7 @@ class PostureAlerter:
     def _get_state(self, name, value):
         """判断单个指标的当前状态"""
         if value is None:
-            return 'green'
+            return 'unknown'
 
         orange_th, red_th = self.thresholds[name]
         abs_val = abs(value) if name in ('head', 'body') else value
@@ -120,27 +120,15 @@ class PostureAlerter:
 
         now = time.time()
 
-        if old_state == 'green':
-            if new_state == 'orange':
-                m['orange_start'] = now
-                m['red_start'] = None
-            elif new_state == 'red':
-                m['orange_start'] = None
-                m['red_start'] = now
-        elif old_state == 'orange':
-            if new_state == 'red':
-                m['orange_start'] = None
-                m['red_start'] = now
-            elif new_state == 'green':
-                m['orange_start'] = None
-                m['red_start'] = None
-        elif old_state == 'red':
-            if new_state == 'orange':
-                m['red_start'] = None
-                m['orange_start'] = now
-            elif new_state == 'green':
-                m['orange_start'] = None
-                m['red_start'] = None
+        if new_state == 'orange':
+            m['orange_start'] = now
+            m['red_start'] = None
+        elif new_state == 'red':
+            m['orange_start'] = None
+            m['red_start'] = now
+        else:  # green or unknown: do not accumulate an alert without valid keypoints
+            m['orange_start'] = None
+            m['red_start'] = None
 
         m['state'] = new_state
 
@@ -167,6 +155,17 @@ class PostureAlerter:
     def _all_green(self):
         """检查是否所有指标都恢复正常"""
         return all(m['state'] == 'green' for m in self.metrics.values())
+
+    def _has_unknown(self):
+        """检查是否有指标因关键点缺失而无法判断。"""
+        return any(m['state'] == 'unknown' for m in self.metrics.values())
+
+    def _stop_alert(self):
+        self.is_alerting = False
+        self.alert_level = self.ALERT_NONE
+        self.buzzer.off()
+        self.beep_on = False
+        self.beep_cycle_start = 0
 
     def _handle_beep(self):
         """根据报警级别控制蜂鸣器的发声模式"""
@@ -216,13 +215,11 @@ class PostureAlerter:
                 self.alert_level = current_alert
                 self.beep_cycle_start = 0
                 self.beep_on = False
+        elif self._has_unknown():
+            self._stop_alert()
         else:
             if self.is_alerting and self._all_green():
-                self.is_alerting = False
-                self.alert_level = self.ALERT_NONE
-                self.buzzer.off()
-                self.beep_on = False
-                self.beep_cycle_start = 0
+                self._stop_alert()
             elif self.is_alerting:
                 self.alert_level = self.ALERT_ORANGE
 
@@ -235,11 +232,7 @@ class PostureAlerter:
             m['state'] = 'green'
             m['orange_start'] = None
             m['red_start'] = None
-        self.is_alerting = False
-        self.alert_level = self.ALERT_NONE
-        self.buzzer.off()
-        self.beep_on = False
-        self.beep_cycle_start = 0
+        self._stop_alert()
 
     def cleanup(self):
         """清理资源"""

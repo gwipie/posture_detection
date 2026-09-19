@@ -125,7 +125,7 @@ def validate_model(model_path):
     return True, session, input_info, output_info
 
 
-def benchmark_inference(session, input_info, output_info, iterations=10):
+def benchmark_inference(session, input_info, output_info, iterations=100):
     """
     基准测试推理性能
     
@@ -157,12 +157,12 @@ def benchmark_inference(session, input_info, output_info, iterations=10):
     
     # 预热（先运行几次）
     print("  🔥 预热推理...")
-    for _ in range(3):
+    for _ in range(20):
         session.run(None, {input_name: test_input})
     
     # 记录内存使用
     process = psutil.Process(os.getpid())
-    memory_before = process.memory_info().rss / 1024 / 1024  # MB
+    peak_rss = process.memory_info().rss / 1024 / 1024  # MB
     
     # 性能测试
     inference_times = []
@@ -173,6 +173,7 @@ def benchmark_inference(session, input_info, output_info, iterations=10):
         
         # 执行推理
         outputs = session.run(None, {input_name: test_input})
+        peak_rss = max(peak_rss, process.memory_info().rss / 1024 / 1024)
         
         end_time = time.perf_counter()
         inference_time = (end_time - start_time) * 1000  # 转换为毫秒
@@ -182,12 +183,10 @@ def benchmark_inference(session, input_info, output_info, iterations=10):
         if (i + 1) % 5 == 0:
             print(f"    已完成 {i+1}/{iterations} 次")
     
-    # 记录内存使用后
-    memory_after = process.memory_info().rss / 1024 / 1024  # MB
-    memory_used = memory_after - memory_before
-    
     # 计算结果
     avg_time = np.mean(inference_times)
+    p50_time = np.percentile(inference_times, 50)
+    p95_time = np.percentile(inference_times, 95)
     min_time = np.min(inference_times)
     max_time = np.max(inference_times)
     std_time = np.std(inference_times)
@@ -195,11 +194,12 @@ def benchmark_inference(session, input_info, output_info, iterations=10):
     
     print("\n📊 性能测试结果:")
     print(f"  ⏱️  平均推理时间: {avg_time:.1f} ms")
+    print(f"  📍 P50 / P95: {p50_time:.1f} / {p95_time:.1f} ms")
     print(f"  📉 最小推理时间: {min_time:.1f} ms")
     print(f"  📈 最大推理时间: {max_time:.1f} ms")
     print(f"  📊 时间标准差: {std_time:.1f} ms")
     print(f"  🎞️  理论帧率: {fps:.1f} FPS")
-    print(f"  💾 推理内存占用: {memory_used:.1f} MB")
+    print(f"  💾 进程 RSS 峰值: {peak_rss:.1f} MB")
     
     # 检查输出结构
     if outputs:
@@ -212,7 +212,7 @@ def benchmark_inference(session, input_info, output_info, iterations=10):
                 print(f"    检测数量: {output.shape[1]}")
                 print(f"    特征维度: {output.shape[2]}")
     
-    return avg_time, fps, memory_used
+    return avg_time, p50_time, p95_time, fps, peak_rss
 
 
 def test_with_sample_image(session, input_info, sample_path=None):
@@ -297,8 +297,8 @@ def main():
     parser = argparse.ArgumentParser(description='验证 YOLOv11n-pose 模型在树莓派 5 上的兼容性')
     parser.add_argument('--model', type=str, default=str(default_model_path),
                        help=f'ONNX 模型文件路径 (默认：{default_model_path})')
-    parser.add_argument('--iterations', type=int, default=10,
-                       help='性能测试迭代次数 (默认：10)')
+    parser.add_argument('--iterations', type=int, default=100,
+                       help='性能测试迭代次数 (默认：100)')
     parser.add_argument('--sample', type=str, default=None,
                        help='样本图像路径 (可选)')
     parser.add_argument('--output', type=str, default='model_validation_report.txt',
@@ -322,7 +322,7 @@ def main():
         sys.exit(1)
     
     # 性能基准测试
-    avg_time, fps, memory_used = benchmark_inference(
+    avg_time, p50_time, p95_time, fps, peak_rss = benchmark_inference(
         session, input_info, output_info, args.iterations
     )
     
@@ -331,7 +331,7 @@ def main():
         test_with_sample_image(session, input_info, args.sample)
     
     # 生成报告
-    report = generate_report(args.model, avg_time, fps, memory_used, input_info)
+    report = generate_report(args.model, avg_time, p50_time, p95_time, fps, peak_rss, input_info)
     save_report(report, args.output)
     
     print("\n" + "=" * 60)
@@ -339,20 +339,12 @@ def main():
     print("=" * 60)
     
     # 给出建议
-    if avg_time < 200:
-        print("🎉 性能良好！模型适合在树莓派5上实时运行")
-        print(f"   预期帧率: {fps:.1f} FPS")
-    else:
-        print("⚠️  推理时间较长，可能需要优化")
-        print("   建议：")
-        print("   1. 确保使用INT8量化模型")
-        print("   2. 降低输入图像分辨率")
-        print("   3. 优化推理批次大小")
+    print(f"纯模型推理吞吐估算: {fps:.1f} FPS；是否满足实时要求需结合端到端时延判断。")
     
     print(f"\n📄 详细报告已保存到: {args.output}")
 
 
-def generate_report(model_path, avg_time, fps, memory_used, input_info):
+def generate_report(model_path, avg_time, p50_time, p95_time, fps, peak_rss, input_info):
     """生成验证报告"""
     import platform
     
@@ -374,25 +366,20 @@ def generate_report(model_path, avg_time, fps, memory_used, input_info):
     
     report_lines.append("📊 性能测试结果:")
     report_lines.append(f"  平均推理时间: {avg_time:.1f} ms")
-    report_lines.append(f"  理论帧率: {fps:.1f} FPS")
-    report_lines.append(f"  内存占用: {memory_used:.1f} MB")
+    report_lines.append(f"  P50 / P95 推理时间: {p50_time:.1f} / {p95_time:.1f} ms")
+    report_lines.append(f"  纯推理吞吐估算: {fps:.1f} FPS")
+    report_lines.append(f"  进程 RSS 峰值: {peak_rss:.1f} MB")
     report_lines.append("")
     
-    report_lines.append("🎯 性能评估:")
-    if avg_time < 150:
-        report_lines.append("  ✅ 优秀 - 适合高帧率实时检测 (5-6 FPS)")
-    elif avg_time < 200:
-        report_lines.append("  ✅ 良好 - 适合实时检测 (4-5 FPS)")
-    elif avg_time < 300:
-        report_lines.append("  ⚠️  一般 - 基本实时检测 (3-4 FPS)")
-    else:
-        report_lines.append("  ❌ 较差 - 需要优化才能达到实时要求")
+    report_lines.append("🎯 口径说明:")
+    report_lines.append("  以上只测模型推理，不包含摄像头、预处理、后处理、显示和GPIO。")
+    report_lines.append("  是否满足实时要求应由业务时延预算和端到端基准共同判断。")
     report_lines.append("")
     
     report_lines.append("💡 优化建议:")
     report_lines.append("  1. 确保使用INT8量化模型以获得最佳性能")
     report_lines.append("  2. 调整输入分辨率以平衡速度与精度")
-    report_lines.append("  3. 考虑使用批次推理以提高吞吐量")
+    report_lines.append("  3. 分别测量预处理、推理、后处理和端到端 P50/P95")
     report_lines.append("  4. 监控树莓派5温度以防止过热降频")
     report_lines.append("")
     
